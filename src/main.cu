@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -20,8 +21,8 @@
 
 #define FILTER_TABLE(X) \
 	X(FILTER_BLUR,     "blur",     "-radius:<1..255> -sigma:<float>",     filter_make_blur,     filter_run_blur)     \
-	X(FILTER_KUWAHARA, "kuwahara", "-radius:<1..255> -sharpness:<float>", filter_make_kuwahara, filter_run_kuwahara)
-
+	X(FILTER_KUWAHARA, "kuwahara", "-radius:<1..255> -sharpness:<float>", filter_make_kuwahara, filter_run_kuwahara) \
+    X(FILTER_GAMMA, "gamma" , "-gamma:<0.1-5.0>",filter_make_gamma, filter_run_gamma)
 ////////////////////////////////////////////
 // Types
 
@@ -58,6 +59,9 @@ struct Filter
 			uint8_t radius;
 			float sharpness;
 		} kuwahara;
+        struct {
+            float gamma_val;
+        } gamma;
 	};
 };
 
@@ -67,6 +71,7 @@ struct Params
 	int   radius;
 	float sigma;
 	float sharpness;
+    float gamma_val;
 };
 
 typedef Filter (*FilterMakeFn)(const Params *p);
@@ -111,6 +116,22 @@ kuwahara_kernel(const uint8_t *in, uint8_t *out, int width, int height, int radi
 	out[i + 2] = in[i + 2];
 }
 
+
+__global__ void 
+gamma_kernel(const uint8_t *in, uint8_t *out, int width, int height, float gamma)
+{
+	int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+	
+	// TODO: kuwahara
+	int i = 3*(y * width + x);
+    for(int j=0; j<3;j++){
+	    float normal_val= in[i+j]/255.0f;
+        float correction=powf(normal_val,gamma);
+        out[i+j]=(uint8_t) (correction * 255.0f);
+    }
+}
 ////////////////////////////////////////////
 // Per-filter make / run
 
@@ -134,6 +155,15 @@ filter_make_kuwahara(const Params *p)
 	return f;
 }
 
+static Filter filter_make_gamma(const Params *p){
+    Filter f;
+	memset(&f, 0, sizeof f);
+    f.kind = FILTER_GAMMA;
+    f.gamma.gamma_val=p->gamma_val;
+	return f;
+}
+
+
 static dim3 
 grid_for(int w, int h, dim3 block)
 {
@@ -156,6 +186,13 @@ filter_run_kuwahara(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int w,
 	cudaDeviceSynchronize();
 }
 
+static void
+filter_run_gamma(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int w, int h)
+{
+	dim3 block(16, 16);
+	gamma_kernel<<<grid_for(w, h, block), block>>>(d_in, d_out, w, h, f->gamma.gamma_val);
+	cudaDeviceSynchronize();
+}
 ////////////////////////////////////////////
 // Dispatch table (generated from FILTER_TABLE; rows are in enum order)
 
@@ -244,6 +281,7 @@ int main(int argc, char **argv)
 		else if ((v = opt_value(opt, "-radius:")))    params.radius    = atoi(v);
 		else if ((v = opt_value(opt, "-sigma:")))     params.sigma     = (float)atof(v);
 		else if ((v = opt_value(opt, "-sharpness:"))) params.sharpness = (float)atof(v);
+        else if ((v = opt_value(opt, "-gamma:"))) params.gamma_val=(float)atof(v);
 		else if ((v = opt_value(opt, "-out:")))       out_path         = v;
 		else
 		{
@@ -259,7 +297,9 @@ int main(int argc, char **argv)
 	}
 	if (params.radius < 1)   params.radius = 1;
 	if (params.radius > 255) params.radius = 255;
-	
+	if (params.gamma_val < 0.1) params.gamma_val=0.1;
+    if (params.gamma_val > 5.0) params.gamma_val=5.0;
+
 	// loading the image
 	Image img = {0};
 	{
