@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -21,7 +22,8 @@
 #define FILTER_TABLE(X) \
 	X(FILTER_BLUR,     "blur",     "-radius:<1..255> -sigma:<float>",     filter_make_blur,     filter_run_blur)     \
 	X(FILTER_KUWAHARA, "kuwahara", "-radius:<1..255> -sharpness:<float>", filter_make_kuwahara, filter_run_kuwahara)  \
-    X(FILTER_BRIGHTNESS, "brightness", "-value:<-255..0..255>", filter_make_brightness, filter_run_brightness)
+    X(FILTER_BRIGHTNESS, "brightness", "-value:<-255..0..255>", filter_make_brightness, filter_run_brightness)  \
+    X(FILTER_GAMMA, "gamma" , "-gamma:<0.1-5.0>",filter_make_gamma, filter_run_gamma)
 ////////////////////////////////////////////
 // Types
 
@@ -62,6 +64,9 @@ struct Filter
 		{
 			float bright;
 		} brightness;
+        struct {
+            float gamma_val;
+        } gamma;
 	};
 };
 
@@ -72,6 +77,7 @@ struct Params
 	float sigma;
 	float sharpness;
     float brightness;
+    float gamma_val;
 };
 
 typedef Filter (*FilterMakeFn)(const Params *p);
@@ -130,7 +136,20 @@ brightness_kernel(const uint8_t *in, uint8_t *out, int width, int height, float 
         val=max(0,min(255,val));
         out[i+j]=(uint8_t)val;
     }
+}
 
+__global__ void
+gamma_kernel(const uint8_t *in, uint8_t *out, int width, int height, float gamma)
+	{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
+	int i = 3*(y * width + x);
+    for(int j=0; j<3;j++){
+	    float normal_val= in[i+j]/255.0f;
+        float correction=powf(normal_val,gamma);
+        out[i+j]=(uint8_t) (correction * 255.0f);
+    }
 }
 ////////////////////////////////////////////
 // Per-filter make / run
@@ -164,6 +183,15 @@ filter_make_brightness(const Params *p)
 	return f;
 }
 
+static Filter filter_make_gamma(const Params *p){
+    Filter f;
+	memset(&f, 0, sizeof f);
+    f.kind = FILTER_GAMMA;
+    f.gamma.gamma_val=p->gamma_val;
+	return f;
+}
+
+
 static dim3 
 grid_for(int w, int h, dim3 block)
 {
@@ -191,6 +219,14 @@ filter_run_brightness(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int 
 {
 	dim3 block(16, 16);
 	brightness_kernel<<<grid_for(w, h, block), block>>>(d_in, d_out, w, h, f->brightness.bright);
+    cudaDeviceSynchronize();
+}
+
+static void
+filter_run_gamma(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int w, int h)
+{
+	dim3 block(16, 16);
+	gamma_kernel<<<grid_for(w, h, block), block>>>(d_in, d_out, w, h, f->gamma.gamma_val);
 	cudaDeviceSynchronize();
 }
 ////////////////////////////////////////////
@@ -281,6 +317,7 @@ int main(int argc, char **argv)
 		else if ((v = opt_value(opt, "-radius:")))    params.radius    = atoi(v);
 		else if ((v = opt_value(opt, "-sigma:")))     params.sigma     = (float)atof(v);
 		else if ((v = opt_value(opt, "-sharpness:"))) params.sharpness = (float)atof(v);
+        else if ((v = opt_value(opt, "-gamma:"))) params.gamma_val=(float)atof(v);
 		else if ((v = opt_value(opt, "-out:")))       out_path         = v;
 		else if ((v = opt_value(opt, "-brightness:")))     params.brightness     = (float)atof(v);
 		else
@@ -297,7 +334,9 @@ int main(int argc, char **argv)
 	}
 	if (params.radius < 1)   params.radius = 1;
 	if (params.radius > 255) params.radius = 255;
-	
+	if (params.gamma_val < 0.1) params.gamma_val=0.1;
+    if (params.gamma_val > 5.0) params.gamma_val=5.0;
+
 	// loading the image
 	Image img = {0};
 	{
