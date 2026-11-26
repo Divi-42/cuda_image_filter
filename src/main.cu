@@ -23,6 +23,7 @@
 	X(FILTER_BLUR,     "blur",     "-radius:<1..255> -sigma:<float>",     filter_make_blur,     filter_run_blur)     \
 	X(FILTER_KUWAHARA, "kuwahara", "-radius:<1..255> -sharpness:<float>", filter_make_kuwahara, filter_run_kuwahara) \
     X(FILTER_HISTOGRAM_EQUALIZATION, "histogram","", filter_make_histogram, filter_run_histogram) \
+    X(FILTER_BRIGHTNESS, "brightness", "-value:<-255..0..255>", filter_make_brightness, filter_run_brightness)  \
     X(FILTER_GAMMA, "gamma" , "-gamma:<0.1-5.0>",filter_make_gamma, filter_run_gamma)
 ////////////////////////////////////////////
 // Types
@@ -67,6 +68,12 @@ struct Filter
             uint8_t * d_final_vals;
             uint32_t total_pixels;
 		} histogram;
+		
+        struct
+		{
+			float bright;
+		} brightness;
+        
         struct {
             float gamma_val;
         } gamma;
@@ -79,6 +86,7 @@ struct Params
 	int   radius;
 	float sigma;
 	float sharpness;
+    float brightness;
     float gamma_val;
 };
 
@@ -262,13 +270,26 @@ writeback_histogram_kernel(const uint8_t *in, uint8_t *out,uint8_t *d_fval, int 
     }
 }
 __global__ void 
-gamma_kernel(const uint8_t *in, uint8_t *out, int width, int height, float gamma)
+brightness_kernel(const uint8_t *in, uint8_t *out, int width, int height, float brightness)
 {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x >= width || y >= height) return;
 	
-	// TODO: kuwahara
+	int i = 3 * (y * width + x);
+    for(int j=0;j<3;j++){
+	    int val = in[i + j] + brightness;
+        val=max(0,min(255,val));
+        out[i+j]=(uint8_t)val;
+    }
+}
+
+__global__ void
+gamma_kernel(const uint8_t *in, uint8_t *out, int width, int height, float gamma)
+	{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= width || y >= height) return;
 	int i = 3*(y * width + x);
     for(int j=0; j<3;j++){
 	    float normal_val= in[i+j]/255.0f;
@@ -306,7 +327,15 @@ filter_make_histogram(const Params *p)
     cudaMalloc(&f.histogram.d_hist,256 * sizeof(uint32_t));
     cudaMalloc(&f.histogram.d_final_vals,256 * sizeof(uint8_t));
     cudaMemset(f.histogram.d_hist,0,256 * sizeof(uint32_t));
+    return f;
+}
 
+static Filter
+filter_make_brightness(const Params *p)
+{
+	Filter f; memset(&f, 0, sizeof f);
+	f.kind = FILTER_BRIGHTNESS;
+	f.brightness.bright = p->brightness;
 	return f;
 }
 
@@ -350,6 +379,14 @@ filter_run_histogram(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int w
 	cdf_kernel<<<1,256>>>(f->histogram.d_hist, f->histogram.d_final_vals, w, h, total_pixels);
 	writeback_histogram_kernel<<<grid_for(w, h, block), block>>>(d_in,d_out,f->histogram.d_final_vals, w, h, total_pixels);
 	cudaDeviceSynchronize();
+}
+
+static void
+filter_run_brightness(const Filter *f, const uint8_t *d_in, uint8_t *d_out, int w, int h)
+{
+	dim3 block(16, 16);
+	brightness_kernel<<<grid_for(w, h, block), block>>>(d_in, d_out, w, h, f->brightness.bright);
+    cudaDeviceSynchronize();
 }
 
 static void
@@ -449,6 +486,7 @@ int main(int argc, char **argv)
 		else if ((v = opt_value(opt, "-sharpness:"))) params.sharpness = (float)atof(v);
         else if ((v = opt_value(opt, "-gamma:"))) params.gamma_val=(float)atof(v);
 		else if ((v = opt_value(opt, "-out:")))       out_path         = v;
+		else if ((v = opt_value(opt, "-brightness:")))     params.brightness     = (float)atof(v);
 		else
 		{
 			fprintf(stderr, "option error: unknown option `%s`.\n", opt);
